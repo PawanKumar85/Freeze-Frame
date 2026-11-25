@@ -53,10 +53,12 @@ _MEDIA_SEQ_RE = re.compile(r"#EXT-X-MEDIA-SEQUENCE:(\d+)")
 _EXTINF_RE = re.compile(r"#EXTINF:(\d+(?:\.\d+)?)")
 _PDT_RE = re.compile(r"#EXT-X-PROGRAM-DATE-TIME:([^\r\n]+)")
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
+_RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
+_CODECS_RE = re.compile(r'CODECS="([^"]+)"')
 
 
 def resolve_lowest_variant_url(hls_url: str, timeout: float = 4.0) -> str:
-    """For multi-variant HLS master playlists, return the lowest-bandwidth variant URL.
+    """For multi-variant HLS master playlists, pick the lowest-resolution (then lowest-bandwidth) video variant.
 
     Falls back to the original URL for media playlists, single-variant streams, or errors.
     """
@@ -71,24 +73,34 @@ def resolve_lowest_variant_url(hls_url: str, timeout: float = 4.0) -> str:
         return hls_url
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    variants: list[tuple[int, str]] = []
-    pending_bw: Optional[int] = None
+    # Sort key: (pixel_area, bandwidth, url)
+    variants: list[tuple[int, int, str]] = []
+    pending_key: Optional[tuple[int, int]] = None
 
     for line in lines:
         if line.startswith("#EXT-X-STREAM-INF"):
-            m = _BANDWIDTH_RE.search(line)
-            pending_bw = int(m.group(1)) if m else 10**12
+            res_m = _RESOLUTION_RE.search(line)
+            bw_m = _BANDWIDTH_RE.search(line)
+            codecs_m = _CODECS_RE.search(line)
+            if not res_m and codecs_m:
+                codecs = codecs_m.group(1).lower()
+                if "avc" not in codecs and "hev" not in codecs and "hvc" not in codecs and "vp9" not in codecs and "av01" not in codecs:
+                    pending_key = None
+                    continue
+            pixels = int(res_m.group(1)) * int(res_m.group(2)) if res_m else 10**12
+            bw = int(bw_m.group(1)) if bw_m else 10**12
+            pending_key = (pixels, bw)
         elif line.startswith("#"):
             continue
-        elif pending_bw is not None:
-            variants.append((pending_bw, urljoin(hls_url, line)))
-            pending_bw = None
+        elif pending_key is not None:
+            variants.append((pending_key[0], pending_key[1], urljoin(hls_url, line)))
+            pending_key = None
 
     if len(variants) <= 1:
-        return variants[0][1] if len(variants) == 1 else hls_url
+        return variants[0][2] if len(variants) == 1 else hls_url
 
-    variants.sort(key=lambda item: item[0])
-    return variants[0][1]
+    variants.sort(key=lambda item: (item[0], item[1]))
+    return variants[0][2]
 
 
 def _parse_iso_utc(raw: str) -> Optional[datetime]:

@@ -8,6 +8,7 @@ import { Button } from "@/components/base/buttons/button";
 import { Input } from "@/components/base/input/input";
 
 const HldFlow = lazy(() => import("@/components/hld/HldFlow"));
+const HistoryView = lazy(() => import("@/components/history/HistoryView"));
 
 const DEFAULT_ROI = { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
 
@@ -46,15 +47,17 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [notifOpen, setNotifOpen] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
-  const [activeTab, setActiveTab] = useState(() =>
-    window.location.pathname === "/hld" || new URLSearchParams(window.location.search).get("tab") === "hld"
-      ? "hld"
-      : "monitor"
-  );
+  const [activeTab, setActiveTab] = useState(() => {
+    const p = window.location.pathname;
+    if (p === "/hld" || new URLSearchParams(window.location.search).get("tab") === "hld") return "hld";
+    if (p === "/history") return "history";
+    return "monitor";
+  });
 
   function switchTab(next) {
     setActiveTab(next);
-    window.history.replaceState(null, "", next === "hld" ? "/hld" : "/");
+    const path = next === "hld" ? "/hld" : next === "history" ? "/history" : "/";
+    window.history.replaceState(null, "", path);
   }
 
   const videoRef = useRef(null);
@@ -212,7 +215,7 @@ export default function App() {
         channel_id: channelId.trim() || "channel_001",
         sample_fps: Number(nextFps) || 2.0,
         alert_after_sec: Number(nextAlert) || 10.0,
-        grid_size: [2, 3, 4].includes(nextGrid) ? nextGrid : 3,
+        grid_size: [2, 3, 4, 5].includes(nextGrid) ? nextGrid : 3,
         eco_mode: Boolean(nextEco),
         roi_x: Number(nextRoi.x.toFixed(4)),
         roi_y: Number(nextRoi.y.toFixed(4)),
@@ -226,13 +229,14 @@ export default function App() {
     nextFps = sampleFps,
     nextAlert = alertAfterSec,
     nextGrid = gridSizeRef.current,
-    nextEco = ecoModeRef.current
+    nextEco = ecoModeRef.current,
+    nextRoi = roiRef.current
   ) {
     if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
     restartTimerRef.current = setTimeout(() => {
       restartTimerRef.current = null;
-      restartIfRunning(roiRef.current, nextFps, nextAlert, nextGrid, nextEco);
-    }, 250);
+      restartIfRunning(nextRoi, nextFps, nextAlert, nextGrid, nextEco);
+    }, 400);
   }
 
   function applyStatus(data) {
@@ -240,7 +244,7 @@ export default function App() {
     setIsRunning(running);
     if (typeof data.sample_fps === "number") setSampleFps(String(data.sample_fps));
     if (typeof data.alert_after_sec === "number") setAlertAfterSec(String(data.alert_after_sec));
-    if (data.grid_size === 2 || data.grid_size === 3 || data.grid_size === 4) setGridSize(data.grid_size);
+    if ([2, 3, 4, 5].includes(data.grid_size)) setGridSize(data.grid_size);
     if (typeof data.eco_mode === "boolean") setEcoMode(data.eco_mode);
     if (typeof data.roi_x === "number") {
       setRoi({ x: data.roi_x, y: data.roi_y, w: data.roi_width, h: data.roi_height });
@@ -356,7 +360,7 @@ export default function App() {
         channel_id: channelId.trim() || "channel_001",
         sample_fps: Number(sampleFps) || 2.0,
         alert_after_sec: Number(alertAfterSec) || 10.0,
-        grid_size: [2, 3, 4].includes(gridSize) ? gridSize : 3,
+        grid_size: [2, 3, 4, 5].includes(gridSize) ? gridSize : 3,
         eco_mode: Boolean(ecoMode),
         roi_x: Number(roi.x.toFixed(4)),
         roi_y: Number(roi.y.toFixed(4)),
@@ -404,7 +408,7 @@ export default function App() {
       return;
     }
     setRoi(next);
-    restartIfRunning(next);
+    scheduleRestart(sampleFps, alertAfterSec, gridSizeRef.current, ecoModeRef.current, next);
   }
 
   return (
@@ -454,6 +458,15 @@ export default function App() {
                 }`}
               >
                 HLD Diagram
+              </button>
+              <button
+                type="button"
+                onClick={() => switchTab("history")}
+                className={`px-3 py-1 rounded-lg cursor-pointer transition ${
+                  activeTab === "history" ? "bg-white text-slate-900 shadow-xs" : "text-slate-600 hover:text-slate-900"
+                }`}
+              >
+                History
               </button>
             </div>
             <BadgeWithDot type="pill-color" size="md" color={badge.color}>
@@ -526,6 +539,12 @@ export default function App() {
           </Suspense>
         )}
 
+        {activeTab === "history" && (
+          <Suspense fallback={<div className="flex items-center justify-center h-64 text-slate-400 text-sm">Loading history…</div>}>
+            <HistoryView />
+          </Suspense>
+        )}
+
         <div className={activeTab === "monitor" ? "grid grid-cols-1 lg:grid-cols-[380px_1fr] gap-4 items-start" : "hidden"}>
           {/* Left Column: Controls & Live Metrics */}
           <div className="space-y-4">
@@ -581,14 +600,21 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium text-slate-700">Detection Grid</span>
                   <span className="text-xs text-slate-500">
-                    {gridSize === 2 ? "4 zones (minimal)" : gridSize === 4 ? "16 zones (logo/ticker safe)" : "9 zones (standard)"}
+                    {gridSize === 2
+                      ? "4 zones (minimal)"
+                      : gridSize === 4
+                        ? "16 zones (logo/ticker safe)"
+                        : gridSize === 5
+                          ? "25 zones (fine-grained)"
+                          : "9 zones (standard)"}
                   </span>
                 </div>
-                <div className="grid grid-cols-3 gap-1.5 rounded-xl bg-slate-200/70 p-1">
+                <div className="grid grid-cols-4 gap-1.5 rounded-xl bg-slate-200/70 p-1">
                   {[
-                    { size: 2, label: "2 × 2 (4)" },
-                    { size: 3, label: "3 × 3 (9)" },
-                    { size: 4, label: "4 × 4 (16)" },
+                    { size: 2, label: "2 × 2" },
+                    { size: 3, label: "3 × 3" },
+                    { size: 4, label: "4 × 4" },
+                    { size: 5, label: "5 × 5" },
                   ].map((opt) => (
                     <button
                       key={opt.size}
@@ -597,7 +623,7 @@ export default function App() {
                         if (gridSize === opt.size) return;
                         setGridSize(opt.size);
                         setFrameState((prev) => ({ ...prev, zoneStates: [] }));
-                        restartIfRunning(roiRef.current, sampleFps, alertAfterSec, opt.size);
+                        scheduleRestart(sampleFps, alertAfterSec, opt.size, ecoModeRef.current);
                       }}
                       className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all cursor-pointer ${
                         gridSize === opt.size
@@ -624,7 +650,7 @@ export default function App() {
                   onClick={() => {
                     const next = !ecoMode;
                     setEcoMode(next);
-                    restartIfRunning(roiRef.current, sampleFps, alertAfterSec, gridSizeRef.current, next);
+                    scheduleRestart(sampleFps, alertAfterSec, gridSizeRef.current, next);
                   }}
                   className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ${
                     ecoMode ? "bg-emerald-600" : "bg-slate-300"
@@ -806,7 +832,9 @@ export default function App() {
                       ? "grid-cols-2 grid-rows-2"
                       : gridSize === 4
                         ? "grid-cols-4 grid-rows-4"
-                        : "grid-cols-3 grid-rows-3"
+                        : gridSize === 5
+                          ? "grid-cols-5 grid-rows-5"
+                          : "grid-cols-3 grid-rows-3"
                   }`}
                 >
                   <span className="absolute -top-1.5 -left-1.5 w-3.5 h-3.5 bg-blue-600 border-2 border-white rounded-xs shadow-md" />

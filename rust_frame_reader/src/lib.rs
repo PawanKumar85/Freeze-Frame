@@ -118,6 +118,7 @@ fn open_video_pipeline(
     // safely across both closed-GOP and open-GOP broadcast streams.
     unsafe {
         let avctx = ctx.as_mut_ptr();
+        (*avctx).flags2 |= ffmpeg::ffi::AV_CODEC_FLAG2_FAST as libc::c_int;
         (*avctx).skip_loop_filter = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
         (*avctx).skip_frame = ffmpeg::ffi::AVDiscard::AVDISCARD_NONREF;
         let _ = eco_mode;

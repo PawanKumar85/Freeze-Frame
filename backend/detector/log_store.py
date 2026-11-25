@@ -32,7 +32,7 @@ class AlertLogStore:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA journal_mode=TRUNCATE")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute(
                 """
@@ -66,10 +66,14 @@ class AlertLogStore:
                     ram_mb REAL,
                     rx_mbps REAL,
                     tx_kbps REAL,
-                    hls_live_delay_sec REAL
+                    hls_live_delay_sec REAL,
+                    zone_states_json TEXT
                 )
                 """
             )
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(metric_logs)").fetchall()}
+            if "zone_states_json" not in cols:
+                self._conn.execute("ALTER TABLE metric_logs ADD COLUMN zone_states_json TEXT")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_metric_logs_channel ON metric_logs(channel_id, id DESC)"
             )
@@ -136,14 +140,16 @@ class AlertLogStore:
         pts_sec = frame_payload.get("pts_sec")
         static_zones = str(frame_payload.get("static_zones") or "—")
         freeze_ratio = frame_payload.get("freeze_ratio")
+        zone_states = frame_payload.get("zone_states")
+        zone_states_json = json.dumps([bool(z) for z in zone_states]) if isinstance(zone_states, list) else None
 
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO metric_logs (
                     created_at, channel_id, stream_state, pts_sec, static_zones, freeze_ratio,
-                    cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec, zone_states_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -157,6 +163,7 @@ class AlertLogStore:
                     sys_stats.get("rx_mbps"),
                     sys_stats.get("tx_kbps"),
                     hls_live_delay_sec,
+                    zone_states_json,
                 ),
             )
             self._metric_inserts += 1
@@ -201,7 +208,7 @@ class AlertLogStore:
                 rows = self._conn.execute(
                     """
                     SELECT id, created_at, channel_id, stream_state, pts_sec, static_zones, freeze_ratio,
-                           cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec
+                           cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec, zone_states_json
                     FROM metric_logs
                     WHERE channel_id = ?
                     ORDER BY id DESC
@@ -213,14 +220,20 @@ class AlertLogStore:
                 rows = self._conn.execute(
                     """
                     SELECT id, created_at, channel_id, stream_state, pts_sec, static_zones, freeze_ratio,
-                           cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec
+                           cpu_pct, ram_mb, rx_mbps, tx_kbps, hls_live_delay_sec, zone_states_json
                     FROM metric_logs
                     ORDER BY id DESC
                     LIMIT ?
                     """,
                     (safe_limit,),
                 ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            raw_zones = d.pop("zone_states_json", None)
+            d["zone_states"] = json.loads(raw_zones) if raw_zones else None
+            out.append(d)
+        return out
 
     def export_metrics_csv(self, limit: int = 5000, channel_id: Optional[str] = None) -> str:
         rows = self.recent_metrics(limit=limit, channel_id=channel_id)
@@ -239,6 +252,7 @@ class AlertLogStore:
             "rx_mbps",
             "tx_kbps",
             "hls_live_delay_sec",
+            "zone_states",
         ])
         for r in rows:
             writer.writerow([
@@ -254,6 +268,7 @@ class AlertLogStore:
                 r["rx_mbps"],
                 r["tx_kbps"],
                 r["hls_live_delay_sec"],
+                json.dumps(r["zone_states"]) if r.get("zone_states") is not None else "",
             ])
         return buf.getvalue()
 

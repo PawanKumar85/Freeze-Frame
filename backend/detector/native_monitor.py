@@ -1,3 +1,5 @@
+import threading
+import time
 from typing import Optional
 
 from detector.protocols import EventSink, FrameSink, StateTracker
@@ -22,6 +24,7 @@ class NativeMonitorRunner:
         self.state_machine = state_machine
         self.on_event = on_event
         self.on_frame = on_frame
+        self._stop_event = threading.Event()
         self._monitor = NativeFreezeMonitor(
             hls_url=extract_cfg.hls_url,
             roi_x=extract_cfg.roi_x,
@@ -42,8 +45,11 @@ class NativeMonitorRunner:
         )
 
     def run(self) -> None:
+        last_pts: Optional[float] = None
+        last_wall = time.monotonic()
+
         with self._monitor:
-            while True:
+            while not self._stop_event.is_set():
                 step_item = self._monitor.next_step()
                 if step_item is None:
                     break
@@ -51,6 +57,8 @@ class NativeMonitorRunner:
                 pts, metrics = step_item
                 if metrics is None:
                     self.state_machine.step(pts, None)
+                    last_pts = pts
+                    last_wall = time.monotonic()
                     continue
 
                 static_zones, total_zones, freeze_ratio, is_static, zone_states = metrics
@@ -82,5 +90,18 @@ class NativeMonitorRunner:
                         "zone_states": zone_states,
                     })
 
+                # Spread segment-burst decoding across real time to prevent 40%+ CPU spikes.
+                now = time.monotonic()
+                if not discontinuity and last_pts is not None and pts > last_pts:
+                    pts_delta = min(1.5, pts - last_pts)
+                    wall_delta = now - last_wall
+                    pace_sleep = pts_delta - wall_delta
+                    if pace_sleep > 0.02:
+                        self._stop_event.wait(timeout=min(0.8, pace_sleep))
+                        now = time.monotonic()
+                last_pts = pts
+                last_wall = now
+
     def close(self) -> None:
+        self._stop_event.set()
         self._monitor.close()

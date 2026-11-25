@@ -114,8 +114,8 @@ const INITIAL_NODES = [
       title: "Models & Thresholds",
       lines: [
         "StreamExtract: 2 FPS, 240×135 (Eco: 1 FPS, 160×90)",
-        "ZoneMetric: 2×2 / 3×3 / 4×4 · MAE ≤ 1.0",
-        "Motion ≤ 1.5%, SSIM ≥ 0.995, ratio 0.75/0.88/0.85",
+        "ZoneMetric: 2×2 / 3×3 / 4×4 / 5×5 · MAE ≤ 0.6",
+        "Motion (|d|>4) ≤ 0.8%, SSIM ≥ 0.997, ratio 0.90–0.95",
       ],
       footer: "StateMachine: 10000ms · backend/models/",
     },
@@ -211,7 +211,7 @@ const INITIAL_NODES = [
         "2) Motion (|d|>6) ≤ 1.5%",
         "3) 2D Prefix-Sum SSIM ≥ 0.995",
       ],
-      footer: "2×2 / 3×3 / 4×4 grid (GIL-free Rust)",
+      footer: "2×2 / 3×3 / 4×4 / 5×5 grid (GIL-free Rust)",
     },
   },
   {

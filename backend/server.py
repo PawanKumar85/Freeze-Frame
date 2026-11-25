@@ -179,8 +179,8 @@ class MonitorManager:
         with self._op_lock:
             self._stop_locked(publish_status=False)
 
-            grid = grid_size if grid_size in (2, 3, 4) else 3
-            freeze_ratio = {2: 0.75, 3: 0.88, 4: 0.85}[grid]
+            grid = grid_size if grid_size in (2, 3, 4, 5) else 3
+            freeze_ratio = {2: 0.90, 3: 0.95, 4: 0.93, 5: 0.92}[grid]
             effective_url = resolve_lowest_variant_url(hls_url)
             effective_fps = min(sample_fps, 1.0) if eco_mode else sample_fps
             proc_w, proc_h = (160, 90) if eco_mode else (240, 135)
@@ -502,7 +502,7 @@ class StartRequest(BaseModel):
     channel_id: str = "channel_001"
     sample_fps: float = Field(default=2.0, gt=0.0)
     alert_after_sec: float = Field(default=10.0, gt=0.0)
-    grid_size: int = Field(default=3, ge=2, le=4)
+    grid_size: int = Field(default=3, ge=2, le=5)
     eco_mode: bool = False
     roi_x: float = 0.0
     roi_y: float = 0.0
@@ -547,6 +547,7 @@ if (FRONTEND_DIST / "assets").is_dir():
 
 @app.get("/")
 @app.get("/hld")
+@app.get("/history")
 def index() -> Response:
     if _INDEX_HTML_BYTES:
         return Response(content=_INDEX_HTML_BYTES, headers=_INDEX_HTML_HEADERS)

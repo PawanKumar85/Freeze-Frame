@@ -1,0 +1,12 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+rust_frame_reader/target/
+frontend/node_modules/
+frontend/dist/
+*.tldr
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

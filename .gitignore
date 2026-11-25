@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Build artifacts & dependencies
+frontend/node_modules/
+frontend/dist/
+rust_frame_reader/target/
+
+# Local SQLite database files
+backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm

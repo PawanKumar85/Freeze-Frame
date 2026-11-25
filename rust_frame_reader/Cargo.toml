@@ -1,0 +1,13 @@
+[package]
+name = "rust_frame_reader"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rust_frame_reader"
+crate-type = ["cdylib"]
+
+[dependencies]
+ffmpeg-next = "9.1"
+libc = "0.2"
+pyo3 = { version = "0.22", features = ["extension-module"] }

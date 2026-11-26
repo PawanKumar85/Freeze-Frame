@@ -175,9 +175,9 @@ const INITIAL_NODES = [
       tone: "orange",
       title: "Demux & Decode",
       lines: [
-        "NativeFrameExtractor + AVIOInterruptCB",
+        "Hybrid Auto / CPU / GPU (VideoToolbox/CUDA/VAAPI)",
         "skip_frame=NONREF, skip_loop_filter=ALL",
-        "Non-video streams AVDISCARD_ALL",
+        "Non-video AVDISCARD_ALL · av_hwframe_transfer",
       ],
       footer: "count=1 decoder · rust_frame_reader/lib.rs",
     },

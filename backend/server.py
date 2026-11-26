@@ -6,9 +6,10 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -129,7 +130,7 @@ class MonitorManager:
         self._running = False
         self._channel_id = ""
         self._hls_url = ""
-        self._sample_fps = 2.0
+        self._sample_fps = 1.0
         self._alert_after_sec = 10.0
         self._roi_x = 0.0
         self._roi_y = 0.0
@@ -137,6 +138,8 @@ class MonitorManager:
         self._roi_height = 1.0
         self._grid_size = 3
         self._eco_mode = False
+        self._decode_mode = "auto"
+        self._active_decoder = ""
         self._last_frame_at = 0.0
         self._last_pts = 0.0
         self._segment_delayed = False
@@ -156,6 +159,8 @@ class MonitorManager:
                 "roi_height": self._roi_height,
                 "grid_size": self._grid_size,
                 "eco_mode": self._eco_mode,
+                "decode_mode": self._decode_mode,
+                "active_decoder": self._active_decoder,
                 "hls_meta": self._hls_meta,
             }
 
@@ -175,6 +180,7 @@ class MonitorManager:
         alert_after_sec: float = 10.0,
         grid_size: int = 3,
         eco_mode: bool = False,
+        decode_mode: str = "auto",
     ) -> dict:
         with self._op_lock:
             self._stop_locked(publish_status=False)
@@ -191,6 +197,7 @@ class MonitorManager:
                 proc_width=proc_w,
                 proc_height=proc_h,
                 eco_mode=eco_mode,
+                decode_mode=decode_mode,
                 roi_x=roi_x,
                 roi_y=roi_y,
                 roi_width=roi_width,
@@ -216,6 +223,8 @@ class MonitorManager:
                 with self._lock:
                     self._last_frame_at = time.monotonic()
                     self._last_pts = payload.get("pts_sec", self._last_pts)
+                    if payload.get("active_decoder"):
+                        self._active_decoder = str(payload["active_decoder"])
                     if self._segment_delayed:
                         self._segment_delayed = False
                         recovered_info = {
@@ -248,6 +257,8 @@ class MonitorManager:
                 self._roi_height = roi_height
                 self._grid_size = grid
                 self._eco_mode = eco_mode
+                self._decode_mode = decode_mode
+                self._active_decoder = ""
                 self._last_frame_at = time.monotonic()
                 self._segment_delayed = False
                 self._runner = runner
@@ -331,11 +342,10 @@ class MonitorManager:
 
             target_dur = meta.get("target_duration_sec") or 4.0
             if is_eco:
-                # In Eco Mode only keyframes are decoded (e.g. 1 per 8-10s segment),
-                # so use playlist media_sequence progress when available to avoid false delays.
+                # In Eco Mode, only fire SEGMENT_DELAY if BOTH playlist sequence and decoded frames stall.
                 if last_seq is not None:
                     seq_gap = now - last_seq_at
-                    delayed_now = seq_gap > max(20.0, target_dur * 2.5)
+                    delayed_now = seq_gap > max(20.0, target_dur * 2.5) and frame_gap > target_dur
                 else:
                     delayed_now = frame_gap > max(30.0, target_dur * 3.5)
             else:
@@ -374,6 +384,7 @@ class MonitorManager:
                 if self._runner is runner:
                     self._running = False
                     self._runner = None
+                    self._active_decoder = ""
                     should_publish = True
             if should_publish:
                 self._broadcaster.publish("status", self.status())
@@ -385,6 +396,7 @@ class MonitorManager:
             self._running = False
             self._runner = None
             self._thread = None
+            self._active_decoder = ""
 
         if runner is not None:
             runner.close()
@@ -500,10 +512,11 @@ SYS_SAMPLER = _SystemStatsSampler()
 class StartRequest(BaseModel):
     hls_url: str
     channel_id: str = "channel_001"
-    sample_fps: float = Field(default=2.0, gt=0.0)
+    sample_fps: float = Field(default=1.0, gt=0.0)
     alert_after_sec: float = Field(default=10.0, gt=0.0)
     grid_size: int = Field(default=3, ge=2, le=5)
     eco_mode: bool = False
+    decode_mode: Literal["auto", "cpu", "gpu"] = "auto"
     roi_x: float = 0.0
     roi_y: float = 0.0
     roi_width: float = 1.0
@@ -530,6 +543,19 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="HLS Freeze Monitor", lifespan=lifespan)
+
+
+class _SelectiveGZipMiddleware(GZipMiddleware):
+    """Compress JSON/CSV/JS/CSS responses while leaving SSE /api/events unbuffered."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/api/events":
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(_SelectiveGZipMiddleware, minimum_size=1000)
 
 
 class _CachedStaticFiles(StaticFiles):
@@ -602,6 +628,7 @@ def start_monitoring(req: StartRequest):
             req.alert_after_sec,
             req.grid_size,
             req.eco_mode,
+            req.decode_mode,
         )
     except Exception as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})

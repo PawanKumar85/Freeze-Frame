@@ -15,10 +15,12 @@ const DEFAULT_ROI = { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
 export default function App() {
   const [hlsUrl, setHlsUrl] = useState("");
   const [channelId, setChannelId] = useState("channel_001");
-  const [sampleFps, setSampleFps] = useState("2.0");
+  const [sampleFps, setSampleFps] = useState("1.0");
   const [alertAfterSec, setAlertAfterSec] = useState("10");
   const [gridSize, setGridSize] = useState(3);
   const [ecoMode, setEcoMode] = useState(false);
+  const [decodeMode, setDecodeMode] = useState("auto");
+  const [activeDecoder, setActiveDecoder] = useState("");
   const [previewEnabled, setPreviewEnabled] = useState(true);
   const [roi, setRoi] = useState(DEFAULT_ROI);
   const [wrapSize, setWrapSize] = useState({ width: 960, height: 540 });
@@ -69,6 +71,7 @@ export default function App() {
   const roiRef = useRef(DEFAULT_ROI);
   const gridSizeRef = useRef(3);
   const ecoModeRef = useRef(false);
+  const decodeModeRef = useRef("auto");
   const previewEnabledRef = useRef(true);
   const isRunningRef = useRef(false);
   const restartTimerRef = useRef(null);
@@ -84,6 +87,10 @@ export default function App() {
   useEffect(() => {
     ecoModeRef.current = ecoMode;
   }, [ecoMode]);
+
+  useEffect(() => {
+    decodeModeRef.current = decodeMode;
+  }, [decodeMode]);
 
   useEffect(() => {
     previewEnabledRef.current = previewEnabled;
@@ -204,7 +211,8 @@ export default function App() {
     nextFps = sampleFps,
     nextAlert = alertAfterSec,
     nextGrid = gridSizeRef.current,
-    nextEco = ecoModeRef.current
+    nextEco = ecoModeRef.current,
+    nextDecode = decodeModeRef.current
   ) {
     if (!isRunningRef.current || !hlsUrl.trim()) return;
     await fetch("/api/start", {
@@ -213,10 +221,11 @@ export default function App() {
       body: JSON.stringify({
         hls_url: hlsUrl.trim(),
         channel_id: channelId.trim() || "channel_001",
-        sample_fps: Number(nextFps) || 2.0,
+        sample_fps: Number(nextFps) || 1.0,
         alert_after_sec: Number(nextAlert) || 10.0,
         grid_size: [2, 3, 4, 5].includes(nextGrid) ? nextGrid : 3,
         eco_mode: Boolean(nextEco),
+        decode_mode: ["auto", "cpu", "gpu"].includes(nextDecode) ? nextDecode : "auto",
         roi_x: Number(nextRoi.x.toFixed(4)),
         roi_y: Number(nextRoi.y.toFixed(4)),
         roi_width: Number(nextRoi.w.toFixed(4)),
@@ -230,12 +239,13 @@ export default function App() {
     nextAlert = alertAfterSec,
     nextGrid = gridSizeRef.current,
     nextEco = ecoModeRef.current,
-    nextRoi = roiRef.current
+    nextRoi = roiRef.current,
+    nextDecode = decodeModeRef.current
   ) {
     if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
     restartTimerRef.current = setTimeout(() => {
       restartTimerRef.current = null;
-      restartIfRunning(nextRoi, nextFps, nextAlert, nextGrid, nextEco);
+      restartIfRunning(nextRoi, nextFps, nextAlert, nextGrid, nextEco, nextDecode);
     }, 400);
   }
 
@@ -246,11 +256,14 @@ export default function App() {
     if (typeof data.alert_after_sec === "number") setAlertAfterSec(String(data.alert_after_sec));
     if ([2, 3, 4, 5].includes(data.grid_size)) setGridSize(data.grid_size);
     if (typeof data.eco_mode === "boolean") setEcoMode(data.eco_mode);
+    if (["auto", "cpu", "gpu"].includes(data.decode_mode)) setDecodeMode(data.decode_mode);
+    if (typeof data.active_decoder === "string") setActiveDecoder(data.active_decoder);
     if (typeof data.roi_x === "number") {
       setRoi({ x: data.roi_x, y: data.roi_y, w: data.roi_width, h: data.roi_height });
     }
     if (!running) {
       setBadge({ text: "IDLE", color: "gray" });
+      setActiveDecoder("");
       setFrameState((prev) => ({ ...prev, isFrozen: null, isStatic: false, zoneStates: [] }));
       stopPreview();
     } else {
@@ -294,6 +307,7 @@ export default function App() {
 
     evtSource.addEventListener("frame", (e) => {
       const d = JSON.parse(e.data);
+      if (d.active_decoder) setActiveDecoder(d.active_decoder);
       const frozen = Boolean(d.is_frozen);
       const nextText = frozen ? "FROZEN" : "NORMAL";
       setBadge((prev) =>
@@ -358,10 +372,11 @@ export default function App() {
       body: JSON.stringify({
         hls_url: hlsUrl.trim(),
         channel_id: channelId.trim() || "channel_001",
-        sample_fps: Number(sampleFps) || 2.0,
+        sample_fps: Number(sampleFps) || 1.0,
         alert_after_sec: Number(alertAfterSec) || 10.0,
         grid_size: [2, 3, 4, 5].includes(gridSize) ? gridSize : 3,
         eco_mode: Boolean(ecoMode),
+        decode_mode: decodeMode,
         roi_x: Number(roi.x.toFixed(4)),
         roi_y: Number(roi.y.toFixed(4)),
         roi_width: Number(roi.w.toFixed(4)),
@@ -627,6 +642,38 @@ export default function App() {
                       }}
                       className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all cursor-pointer ${
                         gridSize === opt.size
+                          ? "bg-white text-slate-900 shadow-xs"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-slate-700">Decode Engine</span>
+                  <span className="text-xs text-slate-500">
+                    {activeDecoder ? `Active: ${activeDecoder.toUpperCase()}` : "Hybrid Auto-Detect"}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 rounded-xl bg-slate-200/70 p-1">
+                  {[
+                    { mode: "auto", label: "Auto" },
+                    { mode: "cpu", label: "CPU" },
+                    { mode: "gpu", label: "GPU" },
+                  ].map((opt) => (
+                    <button
+                      key={opt.mode}
+                      type="button"
+                      onClick={() => {
+                        if (decodeMode === opt.mode) return;
+                        setDecodeMode(opt.mode);
+                        scheduleRestart(sampleFps, alertAfterSec, gridSizeRef.current, ecoModeRef.current, roiRef.current, opt.mode);
+                      }}
+                      className={`rounded-lg px-2 py-1.5 text-xs font-semibold transition-all cursor-pointer ${
+                        decodeMode === opt.mode
                           ? "bg-white text-slate-900 shadow-xs"
                           : "text-slate-600 hover:text-slate-900"
                       }`}

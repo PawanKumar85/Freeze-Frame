@@ -60,6 +60,8 @@ struct Pipeline {
     video_stream_index: usize,
     time_base: f64,
     decoder: ffmpeg::decoder::Video,
+    active_decoder: String,
+    sw_frame: ffmpeg::frame::Video,
     scaler: Option<ScalerState>,
     eof_sent: bool,
     next_sample_pts: Option<f64>,
@@ -80,11 +82,89 @@ impl Drop for Pipeline {
     }
 }
 
+unsafe extern "C" fn hw_get_format(
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    pix_fmts: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    let target = (*ctx).opaque as isize as i32;
+    let mut p = pix_fmts;
+    while !p.is_null() && *p != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+        if (*p as i32) == target {
+            return *p;
+        }
+        p = p.add(1);
+    }
+    if !pix_fmts.is_null() {
+        *pix_fmts
+    } else {
+        ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+    }
+}
+
+fn hw_device_candidates() -> &'static [(ffmpeg::ffi::AVHWDeviceType, &'static str)] {
+    #[cfg(target_os = "macos")]
+    {
+        &[(
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+            "videotoolbox",
+        )]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &[
+            (ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, "cuda"),
+            (ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, "vaapi"),
+            (ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV, "qsv"),
+            (ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM, "drm"),
+        ]
+    }
+}
+
+unsafe fn try_attach_hw_decoder(
+    avctx: *mut ffmpeg::ffi::AVCodecContext,
+) -> Option<String> {
+    let codec = ffmpeg::ffi::avcodec_find_decoder((*avctx).codec_id);
+    if codec.is_null() {
+        return None;
+    }
+
+    for &(dev_type, dev_name) in hw_device_candidates() {
+        let mut i: libc::c_int = 0;
+        loop {
+            let cfg = ffmpeg::ffi::avcodec_get_hw_config(codec, i);
+            if cfg.is_null() {
+                break;
+            }
+            i += 1;
+            let supports_ctx =
+                ((*cfg).methods as u32 & ffmpeg::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as u32) != 0;
+            if supports_ctx && (*cfg).device_type == dev_type {
+                let mut hw_ctx: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+                let ret = ffmpeg::ffi::av_hwdevice_ctx_create(
+                    &mut hw_ctx,
+                    dev_type,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if ret == 0 && !hw_ctx.is_null() {
+                    (*avctx).hw_device_ctx = hw_ctx;
+                    (*avctx).opaque = ((*cfg).pix_fmt as i32 as isize) as *mut libc::c_void;
+                    (*avctx).get_format = Some(hw_get_format);
+                    return Some(format!("gpu:{dev_name}"));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn open_video_pipeline(
     url: &str,
     stop_flag: &Arc<AtomicBool>,
     eco_mode: bool,
-) -> Result<Pipeline, ffmpeg::Error> {
+    decode_mode: &str,
+) -> Result<Pipeline, String> {
     let mut opts = ffmpeg::Dictionary::new();
     if url.starts_with("http://") || url.starts_with("https://") {
         opts.set("reconnect", "1");
@@ -94,7 +174,7 @@ fn open_video_pipeline(
         opts.set("probesize", "500000");
         opts.set("analyzeduration", "1000000");
     }
-    let mut ictx = ffmpeg::format::input_with_dictionary(url, opts)?;
+    let mut ictx = ffmpeg::format::input_with_dictionary(url, opts).map_err(|e| e.to_string())?;
     let interrupt_ptr = Arc::into_raw(Arc::clone(stop_flag));
     unsafe {
         (*ictx.as_mut_ptr()).interrupt_callback = ffmpeg::ffi::AVIOInterruptCB {
@@ -105,18 +185,18 @@ fn open_video_pipeline(
     let stream = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
-        .ok_or(ffmpeg::Error::StreamNotFound)?;
+        .ok_or_else(|| "Video stream not found".to_string())?;
 
     let video_stream_index = stream.index();
     let time_base = f64::from(stream.time_base());
-    let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+    let mut ctx =
+        ffmpeg::codec::context::Context::from_parameters(stream.parameters()).map_err(|e| e.to_string())?;
     ctx.set_threading(ffmpeg::codec::threading::Config {
         kind: ffmpeg::codec::threading::Type::Frame,
         count: 1,
     });
-    // Skip H.264 deblocking loop filter & non-reference B-frames to cut decode CPU
-    // safely across both closed-GOP and open-GOP broadcast streams.
-    unsafe {
+
+    let active_decoder = unsafe {
         let avctx = ctx.as_mut_ptr();
         (*avctx).flags2 |= ffmpeg::ffi::AV_CODEC_FLAG2_FAST as libc::c_int;
         (*avctx).skip_loop_filter = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
@@ -127,8 +207,15 @@ fn open_video_pipeline(
                 (*s.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
             }
         }
-    }
-    let decoder = ctx.decoder().video()?;
+        match decode_mode {
+            "cpu" => "cpu".to_string(),
+            "gpu" => try_attach_hw_decoder(avctx).ok_or_else(|| {
+                "No hardware GPU decoder available on this host/container".to_string()
+            })?,
+            _ => try_attach_hw_decoder(avctx).unwrap_or_else(|| "cpu".to_string()),
+        }
+    };
+    let decoder = ctx.decoder().video().map_err(|e| e.to_string())?;
 
     Ok(Pipeline {
         ictx: Some(ictx),
@@ -136,6 +223,8 @@ fn open_video_pipeline(
         video_stream_index,
         time_base,
         decoder,
+        active_decoder,
+        sw_frame: ffmpeg::frame::Video::empty(),
         scaler: None,
         eof_sent: false,
         next_sample_pts: None,
@@ -153,6 +242,7 @@ pub struct NativeFrameExtractor {
     proc_height: u32,
     sample_fps: f64,
     eco_mode: bool,
+    decode_mode: String,
     pipeline: Mutex<Option<Pipeline>>,
     stop_flag: Arc<AtomicBool>,
 }
@@ -322,11 +412,28 @@ impl NativeFrameExtractor {
                         .map_or(pts + sample_interval, |p| p + sample_interval),
                 );
 
+                let is_hw = unsafe { !(*decoded.as_ptr()).hw_frames_ctx.is_null() };
+                let src_frame: &ffmpeg::frame::Video = if is_hw {
+                    let ret = unsafe {
+                        ffmpeg::ffi::av_hwframe_transfer_data(
+                            pipeline.sw_frame.as_mut_ptr(),
+                            decoded.as_ptr(),
+                            0,
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(format!("av_hwframe_transfer_data failed: {ret}"));
+                    }
+                    &pipeline.sw_frame
+                } else {
+                    &decoded
+                };
+
                 let needs_rebuild = match pipeline.scaler.as_ref() {
                     Some(s) => {
-                        s.src_w != decoded.width()
-                            || s.src_h != decoded.height()
-                            || s.src_fmt != decoded.format()
+                        s.src_w != src_frame.width()
+                            || s.src_h != src_frame.height()
+                            || s.src_fmt != src_frame.format()
                     }
                     None => true,
                 };
@@ -340,14 +447,14 @@ impl NativeFrameExtractor {
                             roi_height,
                             proc_width,
                             proc_height,
-                            &decoded,
+                            src_frame,
                         )
                         .map_err(|e| format!("build_scaler: {e}"))?,
                     );
                 }
 
                 let scaler = pipeline.scaler.as_mut().unwrap();
-                Self::crop_and_scale_gray_into(scaler, &decoded, proc_width, proc_height, out)
+                Self::crop_and_scale_gray_into(scaler, src_frame, proc_width, proc_height, out)
                     .map_err(|e| format!("crop_and_scale_gray: {e}"))?;
                 return Ok(Some(pts));
             }
@@ -407,6 +514,7 @@ impl NativeFrameExtractor {
         proc_height = 180,
         sample_fps = 2.0,
         eco_mode = false,
+        decode_mode = "auto".to_string(),
     ))]
     pub fn new(
         hls_url: String,
@@ -418,6 +526,7 @@ impl NativeFrameExtractor {
         proc_height: u32,
         sample_fps: f64,
         eco_mode: bool,
+        decode_mode: String,
     ) -> PyResult<Self> {
         if hls_url.is_empty() {
             return Err(PyValueError::new_err("HLS URL is required"));
@@ -438,6 +547,12 @@ impl NativeFrameExtractor {
             return Err(PyValueError::new_err("Invalid ROI configuration"));
         }
 
+        let normalized_mode = match decode_mode.to_lowercase().as_str() {
+            "cpu" => "cpu".to_string(),
+            "gpu" => "gpu".to_string(),
+            _ => "auto".to_string(),
+        };
+
         init_ffmpeg();
 
         Ok(Self {
@@ -450,6 +565,7 @@ impl NativeFrameExtractor {
             proc_height,
             sample_fps,
             eco_mode,
+            decode_mode: normalized_mode,
             pipeline: Mutex::new(None),
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
@@ -471,8 +587,9 @@ impl NativeFrameExtractor {
         let url = self.hls_url.clone();
         let stop_flag = Arc::clone(&self.stop_flag);
         let eco_mode = self.eco_mode;
+        let decode_mode = self.decode_mode.clone();
         let pipeline = py
-            .allow_threads(move || open_video_pipeline(&url, &stop_flag, eco_mode))
+            .allow_threads(move || open_video_pipeline(&url, &stop_flag, eco_mode, &decode_mode))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to open stream: {e}")))?;
 
         let mut guard = self
@@ -828,6 +945,7 @@ impl NativeFreezeMonitor {
         motion_pixel_delta = 6,
         max_motion_ratio = 0.015,
         eco_mode = false,
+        decode_mode = "auto".to_string(),
     ))]
     pub fn new(
         hls_url: String,
@@ -846,6 +964,7 @@ impl NativeFreezeMonitor {
         motion_pixel_delta: u32,
         max_motion_ratio: f64,
         eco_mode: bool,
+        decode_mode: String,
     ) -> PyResult<Self> {
         if grid_rows == 0
             || grid_cols == 0
@@ -864,6 +983,7 @@ impl NativeFreezeMonitor {
             proc_height,
             sample_fps,
             eco_mode,
+            decode_mode,
         )?;
         let buf_len = (proc_width * proc_height) as usize;
         Ok(Self {
@@ -889,6 +1009,15 @@ impl NativeFreezeMonitor {
             st.has_prev = false;
         }
         self.extractor.start(py)
+    }
+
+    pub fn active_decoder(&self) -> String {
+        if let Ok(guard) = self.extractor.pipeline.lock() {
+            if let Some(p) = guard.as_ref() {
+                return p.active_decoder.clone();
+            }
+        }
+        String::new()
     }
 
     pub fn reset_prev(&self) {

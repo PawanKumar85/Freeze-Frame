@@ -42,7 +42,11 @@ class NativeMonitorRunner:
             motion_pixel_delta=metric_cfg.motion_pixel_delta,
             max_motion_ratio=metric_cfg.max_motion_ratio,
             eco_mode=extract_cfg.eco_mode,
+            decode_mode=extract_cfg.decode_mode,
         )
+
+    def active_decoder(self) -> str:
+        return self._monitor.active_decoder()
 
     def run(self) -> None:
         last_pts: Optional[float] = None
@@ -88,6 +92,7 @@ class NativeMonitorRunner:
                         "is_static_frame": is_static,
                         "is_frozen": getattr(self.state_machine, "is_frozen", False),
                         "zone_states": zone_states,
+                        "active_decoder": self._monitor.active_decoder(),
                     })
 
                 # Spread segment-burst decoding across real time to prevent 40%+ CPU spikes.

@@ -20,8 +20,9 @@ class StreamExtractConfig:
     proc_width: int = 240
     proc_height: int = 135
 
-    sample_fps: float = 2.0
+    sample_fps: float = 1.0
     eco_mode: bool = False
+    decode_mode: str = "auto"
 
     queue_maxsize: int = 100
     pts_timeout: float = 2.0

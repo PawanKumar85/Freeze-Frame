@@ -282,8 +282,12 @@ export default function App() {
         if (!Array.isArray(data.logs)) return;
         const toneFor = (ev) => {
           if (ev === "FREEZE_DETECTED") return "text-red-600 font-semibold";
-          if (ev === "FREEZE_RECOVERED" || ev === "SEGMENT_DELAY_RECOVERED") return "text-emerald-700 font-semibold";
-          if (ev === "SEGMENT_DELAY" || ev === "ERROR") return "text-amber-700 font-semibold";
+          if (ev === "FREEZE_RECOVERED" || ev === "SEGMENT_DELAY_RECOVERED" || ev === "SEGMENT_DOWNLOAD_RECOVERED") {
+            return "text-emerald-700 font-semibold";
+          }
+          if (ev === "SEGMENT_DELAY" || ev === "SEGMENT_DOWNLOAD_TIMEOUT" || ev === "ERROR") {
+            return "text-amber-700 font-semibold";
+          }
           return "text-slate-700";
         };
         setLogs(
@@ -345,6 +349,15 @@ export default function App() {
         const hlsDelay = d.hls_live_delay_sec != null ? `HLS delay ${d.hls_live_delay_sec}s` : "segments resumed";
         toast.success(`SEGMENT RECOVERED (${d.channel_id})`, { id: "segment-delay" });
         addLog(`${d.event} (${d.channel_id})`, hlsDelay, "text-emerald-700 font-semibold");
+      } else if (d.event === "SEGMENT_DOWNLOAD_TIMEOUT") {
+        const t = d.timeout_sec != null ? `${d.timeout_sec}s timeout` : "download timeout";
+        const segName = d.segment_url ? d.segment_url.split("/").pop() : "playlist";
+        setBadge({ text: "TIMEOUT", color: "warning" });
+        toast.error(`SEGMENT DOWNLOAD TIMEOUT (${d.channel_id}) · ${t}`, { id: "segment-timeout" });
+        addLog(`${d.event} (${d.channel_id})`, `${t} (${segName})`, "text-amber-700 font-semibold");
+      } else if (d.event === "SEGMENT_DOWNLOAD_RECOVERED") {
+        toast.success(`SEGMENT DOWNLOAD RECOVERED (${d.channel_id})`, { id: "segment-timeout" });
+        addLog(`${d.event} (${d.channel_id})`, "segment download resumed", "text-emerald-700 font-semibold");
       } else {
         addLog(`${d.event} (${d.channel_id})`, detail);
       }
@@ -756,49 +769,11 @@ export default function App() {
                 </div>
               </div>
             </div>
-
-            <div className="wax-panel rounded-2xl p-3.5">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold text-slate-700">System Telemetry (Live)</span>
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-slate-400">2s interval</span>
-                  <a
-                    href="/api/metrics/export"
-                    download="freeze_metrics.csv"
-                    className="text-[11px] font-medium text-blue-600 hover:text-blue-800 underline-offset-2 hover:underline"
-                  >
-                    Export CSV
-                  </a>
-                </div>
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <div className="rounded-xl bg-white/75 px-2.5 py-2 border border-slate-200/70">
-                  <div className="text-[11px] text-slate-500">CPU</div>
-                  <div className="text-sm font-bold tabular-nums text-slate-900">
-                    {sysStats.cpu_pct != null ? `${sysStats.cpu_pct}%` : "—"}
-                  </div>
-                </div>
-                <div className="rounded-xl bg-white/75 px-2.5 py-2 border border-slate-200/70">
-                  <div className="text-[11px] text-slate-500">RAM</div>
-                  <div className="text-sm font-bold tabular-nums text-slate-900">
-                    {sysStats.ram_mb != null ? `${sysStats.ram_mb} MiB` : "—"}
-                  </div>
-                </div>
-                <div className="rounded-xl bg-white/75 px-2.5 py-2 border border-slate-200/70">
-                  <div className="text-[11px] text-slate-500">Bandwidth</div>
-                  <div className="text-sm font-bold tabular-nums text-slate-900">
-                    {sysStats.rx_mbps != null ? `${sysStats.rx_mbps} Mbps` : "—"}
-                  </div>
-                  {sysStats.tx_kbps != null && (
-                    <div className="text-[10px] tabular-nums text-slate-400">↑ {sysStats.tx_kbps} KB/s</div>
-                  )}
-                </div>
-              </div>
-            </div>
           </div>
 
-          {/* Right Column: Video Preview */}
-          <div className="wax-panel rounded-2xl p-4">
+          {/* Right Column: Video Preview & System Telemetry */}
+          <div className="space-y-4">
+            <div className="wax-panel rounded-2xl p-4">
             <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
               <span className="text-sm font-semibold text-slate-900">HLS Preview (Drag / Resize Monitoring Area)</span>
               <div className="flex items-center gap-2.5 text-xs">
@@ -934,6 +909,46 @@ export default function App() {
                   })}
                 </div>
               </Rnd>
+            </div>
+            </div>
+
+            <div className="wax-panel rounded-2xl p-4">
+              <div className="flex items-center justify-between mb-2.5">
+                <span className="text-xs font-semibold text-slate-700">System Telemetry (Live)</span>
+                <div className="flex items-center gap-3">
+                  <span className="text-[11px] text-slate-400">2s interval</span>
+                  <a
+                    href="/api/metrics/export"
+                    download="freeze_metrics.csv"
+                    className="text-[11px] font-medium text-blue-600 hover:text-blue-800 underline-offset-2 hover:underline"
+                  >
+                    Export CSV
+                  </a>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="rounded-xl bg-white/75 px-3 py-2.5 border border-slate-200/70">
+                  <div className="text-[11px] text-slate-500">CPU</div>
+                  <div className="text-base font-bold tabular-nums text-slate-900">
+                    {sysStats.cpu_pct != null ? `${sysStats.cpu_pct}%` : "—"}
+                  </div>
+                </div>
+                <div className="rounded-xl bg-white/75 px-3 py-2.5 border border-slate-200/70">
+                  <div className="text-[11px] text-slate-500">RAM</div>
+                  <div className="text-base font-bold tabular-nums text-slate-900">
+                    {sysStats.ram_mb != null ? `${sysStats.ram_mb} MiB` : "—"}
+                  </div>
+                </div>
+                <div className="rounded-xl bg-white/75 px-3 py-2.5 border border-slate-200/70">
+                  <div className="text-[11px] text-slate-500">Bandwidth</div>
+                  <div className="text-base font-bold tabular-nums text-slate-900">
+                    {sysStats.rx_mbps != null ? `${sysStats.rx_mbps} Mbps` : "—"}
+                  </div>
+                  {sysStats.tx_kbps != null && (
+                    <div className="text-[10px] tabular-nums text-slate-400">↑ {sysStats.tx_kbps} KB/s</div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>

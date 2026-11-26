@@ -20,7 +20,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          "vendor-flow": ["@xyflow/react"],
           "vendor-aria": ["react-aria-components"],
           "vendor-hls": ["hls.js"],
           "vendor-ui": ["react-rnd", "react-hot-toast", "tailwind-merge"],

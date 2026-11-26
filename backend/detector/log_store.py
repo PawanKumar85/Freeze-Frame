@@ -151,6 +151,13 @@ class AlertLogStore:
             return f"{gap}{hls_delay}{target}"
         if event == "SEGMENT_DELAY_RECOVERED":
             return f"HLS delay {payload['hls_live_delay_sec']}s" if payload.get("hls_live_delay_sec") is not None else "segments resumed"
+        if event == "SEGMENT_DOWNLOAD_TIMEOUT":
+            t = f"{payload['timeout_sec']}s timeout" if payload.get("timeout_sec") is not None else "download timeout"
+            seg = payload.get("segment_url") or ""
+            seg_name = seg.rsplit("/", 1)[-1] if seg else "playlist"
+            return f"{t} ({seg_name})"
+        if event == "SEGMENT_DOWNLOAD_RECOVERED":
+            return "segment download resumed"
         pts = payload.get("pts_sec")
         pts_str = f"{float(pts):.2f}s" if pts is not None else "—"
         zones = payload.get("static_zones", "—")

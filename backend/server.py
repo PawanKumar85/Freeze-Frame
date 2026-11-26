@@ -17,7 +17,12 @@ from sse_starlette.sse import EventSourceResponse
 import uvicorn
 
 from detector import AlertBroadcaster, FreezeStateMachine, NativeMonitorRunner
-from detector.hls_metadata import fetch_hls_metadata, resolve_lowest_variant_url
+from detector.hls_metadata import (
+    fetch_hls_metadata,
+    is_timeout_error,
+    probe_segment_download,
+    resolve_lowest_variant_url,
+)
 from detector.log_store import AlertLogStore
 from models import StateMachineConfig, StreamExtractConfig, ZoneMetricConfig
 
@@ -303,6 +308,7 @@ class MonitorManager:
         last_meta_time = 0.0
         last_seq: Optional[int] = None
         last_seq_at = time.monotonic()
+        download_timed_out = False
 
         while True:
             # Exit if the runner has been replaced or stopped.
@@ -313,20 +319,59 @@ class MonitorManager:
 
             now = time.monotonic()
 
-            # -- HLS metadata fetch (every POLL_INTERVAL seconds) --
+            # -- HLS metadata & segment download timeout probe (every POLL_INTERVAL seconds) --
             if now - last_meta_time >= POLL_INTERVAL:
                 last_meta_time = now
+                probe_timeout = 5.0
                 try:
                     meta = fetch_hls_metadata(hls_url, timeout=4.0)
                     seq = meta.get("media_sequence")
+                    seg_url = meta.get("last_segment_url")
+                    target_d = meta.get("target_duration_sec") or 5.0
+                    probe_timeout = round(max(4.0, min(10.0, float(target_d))), 1)
+
                     if seq is not None and seq != last_seq:
                         last_seq = seq
                         last_seq_at = now
+                        if seg_url:
+                            probe_segment_download(seg_url, timeout=probe_timeout)
+
+                    if download_timed_out:
+                        download_timed_out = False
+                        with self._lock:
+                            last_pts = self._last_pts
+                        self._broadcaster.publish(
+                            "alert",
+                            {
+                                "channel_id": channel_id,
+                                "event": "SEGMENT_DOWNLOAD_RECOVERED",
+                                "pts_sec": round(last_pts, 3),
+                                "static_zones": "—",
+                                "freeze_ratio": 0.0,
+                            },
+                        )
+
                     with self._lock:
                         if self._runner is runner:
                             self._hls_meta = meta
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if is_timeout_error(exc) and not download_timed_out:
+                        download_timed_out = True
+                        with self._lock:
+                            last_pts = self._last_pts
+                            cur_meta = self._hls_meta
+                        self._broadcaster.publish(
+                            "alert",
+                            {
+                                "channel_id": channel_id,
+                                "event": "SEGMENT_DOWNLOAD_TIMEOUT",
+                                "pts_sec": round(last_pts, 3),
+                                "static_zones": "—",
+                                "freeze_ratio": 0.0,
+                                "timeout_sec": probe_timeout,
+                                "segment_url": cur_meta.get("last_segment_url") or hls_url,
+                            },
+                        )
 
             # -- Frame-gap / segment-delay check (every WATCHDOG_TICK seconds) --
             with self._lock:

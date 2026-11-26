@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@untitledui/icons": "^0.0.23",
-    "@xyflow/react": "^13.0.3",
     "hls.js": "^1.5.17",
     "react": "^19.0.0",
     "react-aria-components": "^1.22.1",

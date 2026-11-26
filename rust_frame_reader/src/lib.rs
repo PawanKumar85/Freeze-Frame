@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
@@ -171,6 +172,7 @@ fn open_video_pipeline(
         opts.set("reconnect_streamed", "1");
         opts.set("reconnect_delay_max", "2");
         opts.set("http_persistent", "1");
+        opts.set("rw_timeout", "8000000");
         opts.set("probesize", "500000");
         opts.set("analyzeduration", "1000000");
     }
@@ -905,11 +907,59 @@ fn evaluate_zones_in_place(
     (static_zones, total_zones, ratio, ratio >= freeze_ratio, zone_states)
 }
 
+fn compute_dhash_and_thumb(gray: &[u8], width: usize, height: usize) -> (u64, Vec<u8>) {
+    if width < 9 || height < 8 || gray.len() < width * height {
+        return (0, Vec::new());
+    }
+    let mut hash: u64 = 0;
+    for y in 0..8 {
+        let row = ((y * height) / 8) * width;
+        for x in 0..8 {
+            let x_left = (x * width) / 9;
+            let x_right = ((x + 1) * width) / 9;
+            if gray[row + x_left] > gray[row + x_right] {
+                hash |= 1u64 << (y * 8 + x);
+            }
+        }
+    }
+    let tw = 32usize;
+    let th = 18usize;
+    let mut thumb = Vec::with_capacity(tw * th);
+    for ty in 0..th {
+        let row = ((ty * height) / th) * width;
+        for tx in 0..tw {
+            thumb.push(gray[row + (tx * width) / tw]);
+        }
+    }
+    (hash, thumb)
+}
+
+fn thumb_is_identical(a: &[u8], b: &[u8], mae_threshold: f64) -> bool {
+    if a.is_empty() || a.len() != b.len() {
+        return false;
+    }
+    let mut sum_diff: u64 = 0;
+    let mut moved: usize = 0;
+    for (&pa, &pb) in a.iter().zip(b.iter()) {
+        let d = (pa as i32 - pb as i32).unsigned_abs();
+        sum_diff += d as u64;
+        if d > 4 {
+            moved += 1;
+        }
+    }
+    let n = a.len() as f64;
+    let mae = (sum_diff as f64) / n;
+    let moved_ratio = (moved as f64) / n;
+    mae <= mae_threshold && moved_ratio <= 0.01
+}
+
 struct MonitorState {
     prev_gray: Vec<u8>,
     curr_gray: Vec<u8>,
     has_prev: bool,
     pref_scratch: Vec<(u64, u64, u64, u64, u64)>,
+    recent_hashes: VecDeque<(u64, Vec<u8>)>,
+    loop_streak: usize,
 }
 
 #[pyclass]
@@ -1000,6 +1050,8 @@ impl NativeFreezeMonitor {
                 curr_gray: vec![0u8; buf_len],
                 has_prev: false,
                 pref_scratch: Vec::new(),
+                recent_hashes: VecDeque::with_capacity(6),
+                loop_streak: 0,
             }),
         })
     }
@@ -1007,6 +1059,8 @@ impl NativeFreezeMonitor {
     pub fn start(&self, py: Python<'_>) -> PyResult<()> {
         if let Ok(mut st) = self.state.lock() {
             st.has_prev = false;
+            st.recent_hashes.clear();
+            st.loop_streak = 0;
         }
         self.extractor.start(py)
     }
@@ -1023,6 +1077,8 @@ impl NativeFreezeMonitor {
     pub fn reset_prev(&self) {
         if let Ok(mut st) = self.state.lock() {
             st.has_prev = false;
+            st.recent_hashes.clear();
+            st.loop_streak = 0;
         }
     }
 
@@ -1045,6 +1101,8 @@ impl NativeFreezeMonitor {
                     curr_gray,
                     has_prev,
                     pref_scratch,
+                    recent_hashes,
+                    loop_streak,
                 } = &mut *st;
 
                 let pts = match self.extractor.pull_next_frame_into(curr_gray)? {
@@ -1052,17 +1110,24 @@ impl NativeFreezeMonitor {
                     None => return Ok(None),
                 };
 
+                let w = self.extractor.proc_width as usize;
+                let h = self.extractor.proc_height as usize;
+                let (curr_hash, curr_thumb) = compute_dhash_and_thumb(curr_gray, w, h);
+
                 if !*has_prev {
                     std::mem::swap(prev_gray, curr_gray);
                     *has_prev = true;
+                    recent_hashes.clear();
+                    recent_hashes.push_back((curr_hash, curr_thumb));
+                    *loop_streak = 0;
                     return Ok(Some((pts, None)));
                 }
 
-                let metrics = evaluate_zones_in_place(
+                let mut metrics = evaluate_zones_in_place(
                     prev_gray,
                     curr_gray,
-                    self.extractor.proc_width as usize,
-                    self.extractor.proc_height as usize,
+                    w,
+                    h,
                     self.grid_rows,
                     self.grid_cols,
                     self.ssim_threshold,
@@ -1072,6 +1137,36 @@ impl NativeFreezeMonitor {
                     self.max_motion_ratio,
                     pref_scratch,
                 );
+
+                // Ping-pong / looping freeze detector: dHash pre-filter + 32x18 pixel MAE confirmation.
+                if !metrics.3 && recent_hashes.len() >= 2 {
+                    let matched_old = recent_hashes
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .any(|(old_h, old_thumb)| {
+                            (curr_hash ^ *old_h).count_ones() <= 1
+                                && thumb_is_identical(&curr_thumb, old_thumb, self.mae_threshold)
+                        });
+                    if matched_old {
+                        *loop_streak += 1;
+                    } else {
+                        *loop_streak = 0;
+                    }
+                    if *loop_streak >= 4 {
+                        metrics.0 = metrics.1;
+                        metrics.2 = 1.0;
+                        metrics.3 = true;
+                        metrics.4.fill(true);
+                    }
+                } else {
+                    *loop_streak = 0;
+                }
+
+                if recent_hashes.len() >= 6 {
+                    recent_hashes.pop_front();
+                }
+                recent_hashes.push_back((curr_hash, curr_thumb));
 
                 std::mem::swap(prev_gray, curr_gray);
                 Ok(Some((pts, Some(metrics))))

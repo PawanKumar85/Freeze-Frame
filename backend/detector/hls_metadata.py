@@ -114,24 +114,63 @@ def _parse_iso_utc(raw: str) -> Optional[datetime]:
         return None
 
 
+def is_timeout_error(exc: BaseException) -> bool:
+    """Return True if exc is a network/HTTP download timeout."""
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        import httpx as _hx
+        if isinstance(exc, _hx.TimeoutException):
+            return True
+    except ImportError:
+        pass
+    msg = str(exc).lower()
+    return "timed out" in msg or "timeout" in msg
+
+
+def probe_segment_download(segment_url: str, timeout: float = 5.0) -> None:
+    """Verify a segment URL responds within timeout using a 1-byte Range/HEAD probe."""
+    if not segment_url or not segment_url.startswith(("http://", "https://")):
+        return
+    try:
+        client = _get_client()
+        resp = client.head(segment_url, timeout=timeout)
+        if resp.status_code == 405:
+            resp = client.get(segment_url, headers={"Range": "bytes=0-0"}, timeout=timeout)
+        resp.raise_for_status()
+    except NameError:
+        from urllib.request import Request, urlopen
+        req = Request(segment_url, method="HEAD", headers={"User-Agent": "HLS-Freeze-Monitor/1.0"})
+        with urlopen(req, timeout=timeout):
+            pass
+
+
 def fetch_hls_metadata(hls_url: str, timeout: float = 4.0) -> dict:
-    """Fetch HLS playlist metadata: target duration, media sequence, and PDT live delay."""
+    """Fetch HLS playlist metadata: target duration, media sequence, PDT live delay, and latest segment URL."""
     if not hls_url.startswith(("http://", "https://")):
         return {}
 
+    base_url = hls_url
     text = _fetch_text(hls_url, timeout=timeout)
     if "#EXT-X-STREAM-INF" in text:
         for line in text.splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                media_url = urljoin(hls_url, line)
-                text = _fetch_text(media_url, timeout=timeout)
+                base_url = urljoin(hls_url, line)
+                text = _fetch_text(base_url, timeout=timeout)
                 break
 
     target_match = _TARGET_DUR_RE.search(text)
     seq_match = _MEDIA_SEQ_RE.search(text)
     extinfs = _EXTINF_RE.findall(text)
     pdts = _PDT_RE.findall(text)
+
+    last_seg_url: Optional[str] = None
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if s and not s.startswith("#"):
+            last_seg_url = urljoin(base_url, s)
+            break
 
     target_duration = float(target_match.group(1)) if target_match else None
     media_sequence = int(seq_match.group(1)) if seq_match else None
@@ -150,4 +189,5 @@ def fetch_hls_metadata(hls_url: str, timeout: float = 4.0) -> dict:
         "media_sequence": media_sequence,
         "last_segment_duration_sec": last_seg_duration,
         "hls_live_delay_sec": pdt_delay_sec,
+        "last_segment_url": last_seg_url,
     }
